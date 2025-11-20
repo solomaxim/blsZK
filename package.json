@@ -21,7 +21,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/yourusername/zk-rollup-bls"
+    "url": "https://github.com/solomaxim/blsZK"
   },
   "keywords": [
     "ethereum",

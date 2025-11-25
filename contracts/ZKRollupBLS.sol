@@ -1,280 +1,423 @@
-// SPDX-License-Identifier: MIT
+/ SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
-
-import "./IBLSVerifier.sol";
 
 /**
  * @title ZKRollupBLS
  * @notice ZK Rollup per verifica batch di firme BLS usando Groth16
- * @dev Utilizza un verifier esterno per le prove ZK
+ * @dev Compatibile con prove generate da snarkjs
+ *
+ * ARCHITETTURA:
+ * - Le prove ZK vengono generate off-chain usando snarkjs
+ * - Il Verifier.sol è generato da snarkjs e verifica le prove
+ * - Questo contratto gestisce il rollup e chiama il verifier
  */
 contract ZKRollupBLS {
-    // ============ STRUCTS ============
+// ============ STRUCTS ============
 
-    struct Batch {
-        bytes32 stateRoot;
-        uint32 numSignatures;
-        uint64 timestamp;
-        address proposer;
-        bool verified;
-        uint64 l2BlockNumber;
-    }
+struct Batch {
+bytes32 stateRoot;
+uint32 numSignatures;
+uint64 timestamp;
+address proposer;
+bool verified;
+uint64 l2BlockNumber;
+}
 
-    struct SignatureSubmission {
-        bytes32 messageHash;
-        uint256 publicKeyX;
-        uint256 publicKeyY;
-        bool included;
-    }
+struct SignatureSubmission {
+bytes32 messageHash;
+uint256 publicKeyX;
+uint256 publicKeyY;
+bool included;
+}
 
-    // ============ STATE VARIABLES ============
+/// @notice Formato prova Groth16 compatibile con snarkjs
+struct Groth16Proof {
+uint256[2] a;
+uint256[2][2] b;
+uint256[2] c;
+}
 
-    address public immutable sequencer;
-    IBLSVerifier public verifier;
+// ============ STATE VARIABLES ============
 
-    uint256 public batchCount;
-    uint256 public submissionCount;
-    uint256 public l2BlockNumber;
-    bytes32 public currentStateRoot;
+address public immutable sequencer;
+address public verifier;
 
-    mapping(uint256 => Batch) public batches;
-    mapping(uint256 => SignatureSubmission) public submissions;
-    mapping(uint256 => uint256[]) public batchSubmissions;
+uint256 public batchCount;
+uint256 public submissionCount;
+uint256 public l2BlockNumber;
+bytes32 public currentStateRoot;
 
-    // ============ EVENTS ============
+mapping(uint256 => Batch) public batches;
+mapping(uint256 => SignatureSubmission) public submissions;
+mapping(uint256 => uint256[]) public batchSubmissions;
 
-    event BatchSubmitted(
-        uint256 indexed batchId,
-        bytes32 stateRoot,
-        uint32 numSignatures,
-        address proposer,
-        uint64 l2BlockNumber
-    );
+// ============ EVENTS ============
 
-    event SignatureSubmitted(
-        uint256 indexed submissionId,
-        bytes32 messageHash,
-        uint256 publicKeyX,
-        uint256 publicKeyY
-    );
+event BatchSubmitted(
+uint256 indexed batchId,
+bytes32 stateRoot,
+uint32 numSignatures,
+address proposer,
+uint64 l2BlockNumber
+);
 
-    event StateUpdated(
-        bytes32 newStateRoot,
-        uint64 newL2BlockNumber
-    );
+event SignatureSubmitted(
+uint256 indexed submissionId,
+bytes32 messageHash,
+uint256 publicKeyX,
+uint256 publicKeyY
+);
 
-    // ============ MODIFIERS ============
+event StateUpdated(
+bytes32 newStateRoot,
+uint64 newL2BlockNumber
+);
 
-    modifier onlySequencer() {
-        require(msg.sender == sequencer, "Only sequencer can call");
-        _;
-    }
+event VerifierUpdated(
+address oldVerifier,
+address newVerifier
+);
 
-    // ============ CONSTRUCTOR ============
+// ============ ERRORS ============
 
-    constructor(address _sequencer, address _verifier) {
-        require(_sequencer != address(0), "Invalid sequencer");
-        require(_verifier != address(0), "Invalid verifier");
+error OnlySequencer();
+error InvalidVerifier();
+error EmptyBatch();
+error LengthMismatch();
+error InvalidZKProof();
+error VerificationFailed();
 
-        sequencer = _sequencer;
-        verifier = IBLSVerifier(_verifier);
-        currentStateRoot = bytes32(0);
-        l2BlockNumber = 0;
-    }
+// ============ MODIFIERS ============
 
-    // ============ EXTERNAL FUNCTIONS ============
+modifier onlySequencer() {
+if (msg.sender != sequencer) revert OnlySequencer();
+_;
+}
 
-    /**
-     * @notice Sottomette un batch di firme con prova ZK
-     * @param _stateRoot Nuovo state root L2 dopo l'applicazione del batch
-     * @param _messageHashes Array di hash dei messaggi firmati
+// ============ CONSTRUCTOR ============
+
+constructor(address _sequencer, address _verifier) {
+if (_sequencer == address(0)) revert InvalidVerifier();
+if (_verifier == address(0)) revert InvalidVerifier();
+
+sequencer = _sequencer;
+verifier = _verifier;
+currentStateRoot = bytes32(0);
+l2BlockNumber = 0;
+}
+
+// ============ EXTERNAL FUNCTIONS ============
+
+/**
+ * @notice Sottomette un batch con prova ZK in formato snarkjs
+     * @param _stateRoot Nuovo state root L2
+     * @param _messageHashes Array di hash dei messaggi
      * @param _publicKeysX Array di coordinate X delle chiavi pubbliche
      * @param _publicKeysY Array di coordinate Y delle chiavi pubbliche
-     * @param _proof Prova ZK Groth16 che verifica tutte le firme
+     * @param _proof Prova Groth16 (a, b, c)
      */
-    function submitBatchWithProof(
-        bytes32 _stateRoot,
-        bytes32[] calldata _messageHashes,
-        uint256[] calldata _publicKeysX,
-        uint256[] calldata _publicKeysY,
-        bytes calldata _proof
-    ) external onlySequencer {
-        require(_messageHashes.length > 0, "Empty batch");
-        require(
-            _messageHashes.length == _publicKeysX.length &&
-            _publicKeysX.length == _publicKeysY.length,
-            "Length mismatch"
-        );
+function submitBatchWithProof(
+bytes32 _stateRoot,
+bytes32[] calldata _messageHashes,
+uint256[] calldata _publicKeysX,
+uint256[] calldata _publicKeysY,
+Groth16Proof calldata _proof
+) external onlySequencer {
+if (_messageHashes.length == 0) revert EmptyBatch();
+if (_messageHashes.length != _publicKeysX.length ||
+_publicKeysX.length != _publicKeysY.length) {
+revert LengthMismatch();
+}
 
-        uint256 batchId = batchCount;
+uint256 batchId = batchCount;
 
-        // Prepara gli input pubblici per la verifica ZK
-        uint256[] memory publicInputs = _preparePublicInputs(
-            _messageHashes,
-            _publicKeysX,
-            _publicKeysY
-        );
+// Prepara gli input pubblici per la verifica
+uint256[] memory publicInputs = _preparePublicInputs(
+_messageHashes,
+_publicKeysX,
+_publicKeysY
+);
 
-        // Verifica la prova ZK
-        bool isValid = verifier.verifyProof(_proof, publicInputs);
-        require(isValid, "Invalid ZK proof");
+// Verifica la prova chiamando il Verifier snarkjs
+bool isValid = _verifyGroth16Proof(_proof, publicInputs);
+if (!isValid) revert InvalidZKProof();
 
-        // Crea e memorizza il batch
-        batches[batchId] = Batch({
-            stateRoot: _stateRoot,
-            numSignatures: uint32(_messageHashes.length),
-            timestamp: uint64(block.timestamp),
-            proposer: msg.sender,
-            verified: true,
-            l2BlockNumber: uint64(l2BlockNumber + 1)
-        });
+// Crea e memorizza il batch
+batches[batchId] = Batch({
+stateRoot: _stateRoot,
+numSignatures: uint32(_messageHashes.length),
+timestamp: uint64(block.timestamp),
+proposer: msg.sender,
+verified: true,
+l2BlockNumber: uint64(l2BlockNumber + 1)
+});
 
-        // Memorizza le submission individuali
-        for (uint256 i = 0; i < _messageHashes.length; i++) {
-            uint256 submissionId = submissionCount++;
+// Memorizza le submission individuali
+for (uint256 i = 0; i < _messageHashes.length; i++) {
+uint256 submissionId = submissionCount++;
 
-            submissions[submissionId] = SignatureSubmission({
-                messageHash: _messageHashes[i],
-                publicKeyX: _publicKeysX[i],
-                publicKeyY: _publicKeysY[i],
-                included: true
-            });
+submissions[submissionId] = SignatureSubmission({
+messageHash: _messageHashes[i],
+publicKeyX: _publicKeysX[i],
+publicKeyY: _publicKeysY[i],
+included: true
+});
 
-            batchSubmissions[batchId].push(submissionId);
+batchSubmissions[batchId].push(submissionId);
 
-            emit SignatureSubmitted(
-                submissionId,
-                _messageHashes[i],
-                _publicKeysX[i],
-                _publicKeysY[i]
-            );
-        }
+emit SignatureSubmitted(
+submissionId,
+_messageHashes[i],
+_publicKeysX[i],
+_publicKeysY[i]
+);
+}
 
-        // Aggiorna stato L2
-        currentStateRoot = _stateRoot;
-        l2BlockNumber++;
-        batchCount++;
+// Aggiorna stato L2
+currentStateRoot = _stateRoot;
+l2BlockNumber++;
+batchCount++;
 
-        emit BatchSubmitted(
-            batchId,
-            _stateRoot,
-            uint32(_messageHashes.length),
-            msg.sender,
-            uint64(l2BlockNumber)
-        );
+emit BatchSubmitted(
+batchId,
+_stateRoot,
+uint32(_messageHashes.length),
+msg.sender,
+uint64(l2BlockNumber)
+);
 
-        emit StateUpdated(_stateRoot, uint64(l2BlockNumber));
-    }
+emit StateUpdated(_stateRoot, uint64(l2BlockNumber));
+}
 
-    /**
-     * @notice Sottomette una singola firma per inclusion in un batch futuro
-     * @dev Le submission sono solo memorizzate, verificate in batch con ZK
+/**
+ * @notice Versione con bytes per retrocompatibilità
+     * @dev Decodifica la prova da bytes e chiama la versione struct
      */
-    function submitSignature(
-        bytes32 _messageHash,
-        uint256 _publicKeyX,
-        uint256 _publicKeyY
-    ) external {
-        uint256 submissionId = submissionCount++;
+function submitBatchWithProofBytes(
+bytes32 _stateRoot,
+bytes32[] calldata _messageHashes,
+uint256[] calldata _publicKeysX,
+uint256[] calldata _publicKeysY,
+bytes calldata _proofBytes
+) external onlySequencer {
+if (_messageHashes.length == 0) revert EmptyBatch();
+if (_messageHashes.length != _publicKeysX.length ||
+_publicKeysX.length != _publicKeysY.length) {
+revert LengthMismatch();
+}
 
-        submissions[submissionId] = SignatureSubmission({
-            messageHash: _messageHash,
-            publicKeyX: _publicKeyX,
-            publicKeyY: _publicKeyY,
-            included: false  // Sarà incluso quando un batch viene sottoposto
-        });
+// Decodifica prova da bytes (formato: a[0], a[1], b[0][0], b[0][1], b[1][0], b[1][1], c[0], c[1])
+Groth16Proof memory proof = _decodeProof(_proofBytes);
 
-        emit SignatureSubmitted(
-            submissionId,
-            _messageHash,
-            _publicKeyX,
-            _publicKeyY
-        );
-    }
+uint256 batchId = batchCount;
 
-    // ============ VIEW FUNCTIONS ============
+uint256[] memory publicInputs = _preparePublicInputs(
+_messageHashes,
+_publicKeysX,
+_publicKeysY
+);
 
-    /**
-     * @notice Restituisce i dettagli di un batch
+bool isValid = _verifyGroth16Proof(proof, publicInputs);
+if (!isValid) revert InvalidZKProof();
+
+// Stesso codice di submitBatchWithProof...
+batches[batchId] = Batch({
+stateRoot: _stateRoot,
+numSignatures: uint32(_messageHashes.length),
+timestamp: uint64(block.timestamp),
+proposer: msg.sender,
+verified: true,
+l2BlockNumber: uint64(l2BlockNumber + 1)
+});
+
+for (uint256 i = 0; i < _messageHashes.length; i++) {
+uint256 submissionId = submissionCount++;
+
+submissions[submissionId] = SignatureSubmission({
+messageHash: _messageHashes[i],
+publicKeyX: _publicKeysX[i],
+publicKeyY: _publicKeysY[i],
+included: true
+});
+
+batchSubmissions[batchId].push(submissionId);
+
+emit SignatureSubmitted(
+submissionId,
+_messageHashes[i],
+_publicKeysX[i],
+_publicKeysY[i]
+);
+}
+
+currentStateRoot = _stateRoot;
+l2BlockNumber++;
+batchCount++;
+
+emit BatchSubmitted(
+batchId,
+_stateRoot,
+uint32(_messageHashes.length),
+msg.sender,
+uint64(l2BlockNumber)
+);
+
+emit StateUpdated(_stateRoot, uint64(l2BlockNumber));
+}
+
+/**
+ * @notice Sottomette una singola firma per inclusione futura
      */
-    function getBatch(uint256 _batchId) external view returns (
-        bytes32 stateRoot,
-        uint32 numSignatures,
-        uint64 timestamp,
-        address proposer,
-        bool verified,
-        uint64 l2BlockNumber
-    ) {
-        Batch memory batch = batches[_batchId];
-        return (
-            batch.stateRoot,
-            batch.numSignatures,
-            batch.timestamp,
-            batch.proposer,
-            batch.verified,
-            batch.l2BlockNumber
-        );
-    }
+function submitSignature(
+bytes32 _messageHash,
+uint256 _publicKeyX,
+uint256 _publicKeyY
+) external {
+uint256 submissionId = submissionCount++;
 
-    /**
-     * @notice Restituisce gli ID delle submission in un batch
+submissions[submissionId] = SignatureSubmission({
+messageHash: _messageHash,
+publicKeyX: _publicKeyX,
+publicKeyY: _publicKeyY,
+included: false
+});
+
+emit SignatureSubmitted(
+submissionId,
+_messageHash,
+_publicKeyX,
+_publicKeyY
+);
+}
+
+// ============ VIEW FUNCTIONS ============
+
+function getBatch(uint256 _batchId) external view returns (
+bytes32 stateRoot,
+uint32 numSignatures,
+uint64 timestamp,
+address proposer,
+bool verified,
+uint64 batchL2BlockNumber
+) {
+Batch memory batch = batches[_batchId];
+return (
+batch.stateRoot,
+batch.numSignatures,
+batch.timestamp,
+batch.proposer,
+batch.verified,
+batch.l2BlockNumber
+);
+}
+
+function getBatchSubmissions(uint256 _batchId) external view returns (uint256[] memory) {
+return batchSubmissions[_batchId];
+}
+
+function getL2State() external view returns (
+bytes32 stateRoot,
+uint256 blockNumber,
+uint256 totalBatches
+) {
+return (currentStateRoot, l2BlockNumber, batchCount);
+}
+
+function isSignatureVerified(uint256 _submissionId) external view returns (bool) {
+return submissions[_submissionId].included;
+}
+
+// ============ INTERNAL FUNCTIONS ============
+
+/**
+ * @notice Verifica prova Groth16 chiamando il Verifier snarkjs
      */
-    function getBatchSubmissions(uint256 _batchId) external view returns (uint256[] memory) {
-        return batchSubmissions[_batchId];
-    }
+function _verifyGroth16Proof(
+Groth16Proof memory _proof,
+uint256[] memory _publicInputs
+) internal view returns (bool) {
+// Costruisci la chiamata al verifier snarkjs
+// Il verifier generato da snarkjs ha la signature:
+// verifyProof(uint[2] a, uint[2][2] b, uint[2] c, uint[n] input)
 
-    /**
-     * @notice Restituisce lo stato corrente di L2
+bytes memory callData = abi.encodeWithSignature(
+"verifyProof(uint256[2],uint256[2][2],uint256[2],uint256[])",
+_proof.a,
+_proof.b,
+_proof.c,
+_publicInputs
+);
+
+(bool success, bytes memory result) = verifier.staticcall(callData);
+
+if (!success || result.length == 0) {
+return false;
+}
+
+return abi.decode(result, (bool));
+}
+
+/**
+ * @notice Prepara gli input pubblici per il verifier
      */
-    function getL2State() external view returns (
-        bytes32 stateRoot,
-        uint256 blockNumber,
-        uint256 totalBatches
-    ) {
-        return (
-            currentStateRoot,
-            l2BlockNumber,
-            batchCount
-        );
-    }
+function _preparePublicInputs(
+bytes32[] calldata _messageHashes,
+uint256[] calldata _publicKeysX,
+uint256[] calldata _publicKeysY
+) internal pure returns (uint256[] memory) {
+// Per un batch di N firme, abbiamo 3N input pubblici
+uint256[] memory publicInputs = new uint256[](_messageHashes.length * 3);
 
-    /**
-     * @notice Verifica se una submission è inclusa in un batch verificato
+for (uint256 i = 0; i < _messageHashes.length; i++) {
+publicInputs[i * 3] = uint256(_messageHashes[i]);
+publicInputs[i * 3 + 1] = _publicKeysX[i];
+publicInputs[i * 3 + 2] = _publicKeysY[i];
+}
+
+return publicInputs;
+}
+
+/**
+ * @notice Decodifica prova da bytes
      */
-    function isSignatureVerified(uint256 _submissionId) external view returns (bool) {
-        SignatureSubmission memory submission = submissions[_submissionId];
-        return submission.included;
-    }
+function _decodeProof(bytes calldata _proofBytes) internal pure returns (Groth16Proof memory) {
+require(_proofBytes.length >= 256, "Proof too short");
 
-    // ============ INTERNAL FUNCTIONS ============
+Groth16Proof memory proof;
 
-    /**
-     * @notice Prepara gli input pubblici per la verifica ZK
-     * @dev Gli input devono corrispondere all'ordine nel circuito
+// Decodifica 8 uint256 (32 bytes ciascuno)
+proof.a[0] = _bytesToUint256(_proofBytes, 0);
+proof.a[1] = _bytesToUint256(_proofBytes, 32);
+proof.b[0][0] = _bytesToUint256(_proofBytes, 64);
+proof.b[0][1] = _bytesToUint256(_proofBytes, 96);
+proof.b[1][0] = _bytesToUint256(_proofBytes, 128);
+proof.b[1][1] = _bytesToUint256(_proofBytes, 160);
+proof.c[0] = _bytesToUint256(_proofBytes, 192);
+proof.c[1] = _bytesToUint256(_proofBytes, 224);
+
+return proof;
+}
+
+function _bytesToUint256(bytes calldata _bytes, uint256 _start) internal pure returns (uint256) {
+require(_start + 32 <= _bytes.length, "Out of bounds");
+uint256 result;
+assembly {
+result := calldataload(add(_bytes.offset, _start))
+}
+return result;
+}
+
+// ============ ADMIN FUNCTIONS ============
+
+/**
+ * @notice Aggiorna il verifier (solo sequencer, per upgrade)
      */
-    function _preparePublicInputs(
-        bytes32[] calldata _messageHashes,
-        uint256[] calldata _publicKeysX,
-        uint256[] calldata _publicKeysY
-    ) internal pure returns (uint256[] memory) {
-        // Per un batch di N firme, abbiamo 3N input pubblici:
-        // [msgHash1, pkX1, pkY1, msgHash2, pkX2, pkY2, ...]
-        uint256[] memory publicInputs = new uint256[](_messageHashes.length * 3);
+function updateVerifier(address _newVerifier) external onlySequencer {
+if (_newVerifier == address(0)) revert InvalidVerifier();
 
-        for (uint256 i = 0; i < _messageHashes.length; i++) {
-            publicInputs[i * 3] = uint256(_messageHashes[i]);
-            publicInputs[i * 3 + 1] = _publicKeysX[i];
-            publicInputs[i * 3 + 2] = _publicKeysY[i];
-        }
+address oldVerifier = verifier;
+verifier = _newVerifier;
 
-        return publicInputs;
-    }
-
-    /**
-     * @notice Aggiorna il verifier (solo per emergenze/upgrade)
-     */
-    function updateVerifier(address _newVerifier) external onlySequencer {
-        require(_newVerifier != address(0), "Invalid verifier");
-        verifier = IBLSVerifier(_newVerifier);
-    }
+emit VerifierUpdated(oldVerifier, _newVerifier);
+}
 }

@@ -9,9 +9,7 @@ deployments/
 *.log
 
 
-# Rust
-**/*.rs.bk
-Cargo.lock  # Solo se è una libreria, se è un eseguibile tieni il lock
+
 
 # Node.js
 node_modules/
